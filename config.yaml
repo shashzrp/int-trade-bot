@@ -1,0 +1,75 @@
+# ──────────────────────────────────────────────────────────────
+# Strategy configuration — every threshold is tunable here.
+# This file is SAFE TO COMMIT. Paper-vs-live lives ONLY in .env.
+# ──────────────────────────────────────────────────────────────
+
+universe:
+  price_min: 5
+  price_max: 500
+  adv_min_shares: 1_000_000
+  premarket_volume_min: 50_000
+  rvol_min: 2.0
+  gap_min_pct: 2.0
+  gap_max_pct: 20.0
+  mega_cap_gap_min_pct: 1.0
+  mega_caps: [AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSLA]
+  daily_atr_pct_min: 2.0
+  spread_max_pct: 0.1
+  exclude_earnings_today: true
+  max_watchlist_size: 10
+
+indicators:
+  opening_range_minutes: 15
+  ema_fast: 9
+  ema_slow: 20
+  rsi_period: 14
+  macd: [12, 26, 9]
+  atr_period: 14
+  atr_timeframe_min: 5
+  volume_ma_bars: 20
+  vwap_bands_sigma: [1.0, 2.0]
+
+entry:
+  rsi_long_band: [50, 70]
+  rsi_short_band: [30, 50]
+  rvol_bar_min: 1.5
+  morning_start: "09:45"
+  morning_end:   "11:30"
+  afternoon_start: "13:00"
+  afternoon_end:   "15:00"
+  afternoon_rvol_min: 3.0
+
+stops:
+  atr_multiplier: 1.5
+  max_risk_per_share_pct: 2.0
+  structural_buffer: 0.05
+
+exits:
+  t1_R: 1.0
+  t2_R: 2.0
+  scale_fractions: [0.333, 0.333, 0.334]
+  trail_ema: 9
+  forced_flat_time: "15:55"
+
+risk:
+  per_trade_pct: 1.0
+  max_notional_pct: 20.0
+  daily_loss_cap_pct: 3.0
+  weekly_loss_cap_pct: 6.0
+  max_consecutive_losses: 3
+  max_concurrent_positions: 3
+  max_trades_per_day: 5
+  symbol_cooldown_minutes: 5
+
+orders:
+  limit_offset_cents: 1
+  chase_max_attempts: 3
+  chase_wait_seconds: 3
+
+stream:
+  heartbeat_timeout_seconds: 10
+  bar_close_grace_seconds: 2
+
+observability:
+  metrics_port: 9100
+  log_level: INFO
