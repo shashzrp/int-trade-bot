@@ -16,17 +16,18 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import pytest
+from requests.exceptions import RequestException
 
 from config import StrategyConfig
 from scanner import (
     DEFAULT_CANDIDATE_SYMBOLS,
+    FINNHUB_EARNINGS_URL,
+    FinnhubEarningsCalendar,
     MAX_SYMBOLS_PER_SCAN,
     NY_TZ,
     Candidate,
     ScanResult,
     UniverseScanner,
-    YFinanceEarningsCalendar,
-    _yfinance_unverified_session,
 )
 
 
@@ -99,7 +100,7 @@ def _make_scanner(cfg, *,
     tc.get_asset.side_effect = fake_get_asset
 
     # Always supply a deterministic predicate so the scanner never falls
-    # through to the default yfinance lookup during tests.
+    # through to the default Finnhub lookup during tests.
     earn_set = {s.upper() for s in (earnings_today or set())}
     earnings_predicate = lambda sym, day: sym.upper() in earn_set  # noqa: E731
 
@@ -281,6 +282,9 @@ def test_earnings_today_excluded(cfg, asof):
     quotes = {s: _quote(104.95, 105.05) for s in ("AAA", "BBB")}
     scn = _make_scanner(cfg, symbols=["AAA", "BBB"], daily=daily, premkt=premkt,
                         quotes=quotes, earnings_today={"AAA"})
+    # config.yaml may have exclude_earnings_today=false; this test specifically
+    # exercises the filter, so force it on regardless of YAML state.
+    scn.cfg = {**scn.cfg, "exclude_earnings_today": True}
     res = scn.scan(asof=asof)
     assert {c.symbol for c in res.watchlist} == {"BBB"}
     assert res.rejections["AAA"] == "earnings_today"
@@ -320,158 +324,183 @@ def test_insufficient_history_rejected(cfg, asof):
     assert res.rejections["X"] == "insufficient_daily_history"
 
 
-# ── YFinanceEarningsCalendar ───────────────────────────────────────────
+# ── FinnhubEarningsCalendar ────────────────────────────────────────────
 
-def _mock_earnings_df(*dates_ny: datetime) -> pd.DataFrame:
-    """Build a yfinance-shaped earnings DataFrame indexed by tz-aware ts."""
-    idx = pd.DatetimeIndex(dates_ny)
-    return pd.DataFrame(
-        {"EPS Estimate": [None] * len(idx),
-         "Reported EPS": [None] * len(idx),
-         "Surprise(%)": [None] * len(idx)},
-        index=idx,
-    )
-
-
-def _patch_yf_ticker(monkeypatch, *, by_symbol: dict[str, object]):
-    """Patch scanner.yf.Ticker so each symbol returns a canned mock.
-
-    Each value in ``by_symbol`` is either a DataFrame (returned from
-    ``get_earnings_dates``) or an Exception instance (raised from it).
-    """
-    def fake_ticker(sym: str, *args, **kwargs):
-        # Accept (and ignore) the session= kwarg the scanner now passes.
-        mock = MagicMock()
-        canned = by_symbol.get(sym.upper())
-        if isinstance(canned, BaseException):
-            mock.get_earnings_dates.side_effect = canned
-        else:
-            mock.get_earnings_dates.return_value = canned
-        return mock
-
-    import scanner as scanner_mod
-    monkeypatch.setattr(scanner_mod.yf, "Ticker", fake_ticker)
+def _finnhub_session(payload: dict | None = None, *,
+                     get_exception: BaseException | None = None,
+                     raise_for_status: BaseException | None = None) -> MagicMock:
+    """Build a mock ``requests.Session`` that returns a canned Finnhub
+    response. Either ``payload`` is returned via ``.json()``, or ``.get()``
+    raises ``get_exception`` outright, or ``.raise_for_status()`` raises."""
+    session = MagicMock()
+    if get_exception is not None:
+        session.get.side_effect = get_exception
+        return session
+    response = MagicMock()
+    if raise_for_status is not None:
+        response.raise_for_status.side_effect = raise_for_status
+    else:
+        response.raise_for_status.return_value = None
+    response.json.return_value = payload or {}
+    session.get.return_value = response
+    return session
 
 
-def test_yf_calendar_hits_on_matching_session_day(monkeypatch, asof):
-    """A symbol whose earnings calendar lists the session day → True."""
+def _finnhub_payload(*items: dict) -> dict:
+    """Shape Finnhub's /calendar/earnings JSON: {"earningsCalendar": [...]}."""
+    return {"earningsCalendar": list(items)}
+
+
+def test_finnhub_returns_true_when_symbol_in_calendar(asof):
+    """A symbol whose Finnhub calendar entry matches session_day → True."""
     session_day = asof.date()  # 2026-05-25
-    df = _mock_earnings_df(datetime(2026, 5, 25, 16, 30, tzinfo=NY_TZ))
-    _patch_yf_ticker(monkeypatch, by_symbol={"AAA": df})
-
-    cal = YFinanceEarningsCalendar()
-    assert cal("AAA", session_day) is True
-
-
-def test_yf_calendar_misses_on_other_days(monkeypatch, asof):
-    """No matching date in the calendar → False."""
-    session_day = asof.date()
-    df = _mock_earnings_df(
-        datetime(2026, 5, 26, 16, 30, tzinfo=NY_TZ),
-        datetime(2026, 5, 24, 9, 0, tzinfo=NY_TZ),
+    payload = _finnhub_payload(
+        {"symbol": "AAA", "date": "2026-05-25", "hour": "amc"},
+        {"symbol": "BBB", "date": "2026-05-25", "hour": "bmo"},
     )
-    _patch_yf_ticker(monkeypatch, by_symbol={"BBB": df})
+    cal = FinnhubEarningsCalendar(api_key="test-key",
+                                   session=_finnhub_session(payload))
+    assert cal("AAA", session_day) is True
+    assert cal("BBB", session_day) is True
 
-    cal = YFinanceEarningsCalendar()
-    assert cal("BBB", session_day) is False
 
-
-def test_yf_calendar_bmo_and_amc_both_count(monkeypatch, asof):
-    """Before-market and after-market both share the calendar date."""
+def test_finnhub_returns_false_when_symbol_not_in_calendar(asof):
+    """Symbol absent from the Finnhub set → False."""
     session_day = asof.date()
-    bmo = _mock_earnings_df(datetime(2026, 5, 25, 7, 0, tzinfo=NY_TZ))   # 07:00 ET
-    amc = _mock_earnings_df(datetime(2026, 5, 25, 16, 30, tzinfo=NY_TZ)) # 16:30 ET
-    _patch_yf_ticker(monkeypatch, by_symbol={"BMO": bmo, "AMC": amc})
+    payload = _finnhub_payload({"symbol": "OTHER", "date": "2026-05-25"})
+    cal = FinnhubEarningsCalendar(api_key="test-key",
+                                   session=_finnhub_session(payload))
+    assert cal("AAA", session_day) is False
 
-    cal = YFinanceEarningsCalendar()
+
+def test_finnhub_bmo_and_amc_both_count(asof):
+    """BMO and AMC entries on the session day are both flagged."""
+    session_day = asof.date()
+    payload = _finnhub_payload(
+        {"symbol": "BMO", "date": "2026-05-25", "hour": "bmo"},
+        {"symbol": "AMC", "date": "2026-05-25", "hour": "amc"},
+    )
+    cal = FinnhubEarningsCalendar(api_key="test-key",
+                                   session=_finnhub_session(payload))
     assert cal("BMO", session_day) is True
     assert cal("AMC", session_day) is True
 
 
-def test_yf_calendar_caches_per_session_day(monkeypatch, asof):
-    """Two calls for the same (symbol, day) must not re-query yfinance."""
+def test_finnhub_filters_next_day_entries_out(asof):
+    """Entries from session_day+1 (returned because we fetch a 2-day range)
+    must NOT count against today — date equality filter kicks them out."""
+    session_day = asof.date()  # 2026-05-25
+    payload = _finnhub_payload(
+        {"symbol": "TODAY",    "date": "2026-05-25"},
+        {"symbol": "TOMORROW", "date": "2026-05-26"},
+    )
+    cal = FinnhubEarningsCalendar(api_key="test-key",
+                                   session=_finnhub_session(payload))
+    assert cal("TODAY",    session_day) is True
+    assert cal("TOMORROW", session_day) is False
+
+
+def test_finnhub_single_fetch_per_session_day(asof):
+    """Spec: one Alpaca/Finnhub call per session_day, regardless of how
+    many _has_earnings_today queries fire. Subsequent lookups are O(1)."""
     session_day = asof.date()
-    df = _mock_earnings_df(datetime(2026, 5, 25, 16, 30, tzinfo=NY_TZ))
+    session = _finnhub_session(_finnhub_payload(
+        {"symbol": "AAA", "date": "2026-05-25"},
+    ))
+    cal = FinnhubEarningsCalendar(api_key="test-key", session=session)
 
-    call_count = {"n": 0}
-    def counting_ticker(sym, *args, **kwargs):
-        call_count["n"] += 1
-        m = MagicMock()
-        m.get_earnings_dates.return_value = df
-        return m
-    import scanner as scanner_mod
-    monkeypatch.setattr(scanner_mod.yf, "Ticker", counting_ticker)
+    cal("AAA", session_day)
+    cal("BBB", session_day)
+    cal("CCC", session_day)
+    cal("AAA", session_day)
+    assert session.get.call_count == 1
 
-    cal = YFinanceEarningsCalendar()
-    cal("AAA", session_day)
-    cal("AAA", session_day)
-    cal("AAA", session_day)
-    assert call_count["n"] == 1
-
-    # A different session day must miss the cache and query again.
+    # New session day forces a second call.
     cal("AAA", session_day + timedelta(days=1))
-    assert call_count["n"] == 2
+    assert session.get.call_count == 2
 
 
-def test_yf_calendar_handles_network_failure(monkeypatch, asof):
-    """A lookup exception → fails open (False) and caches the negative."""
+def test_finnhub_request_params_match_spec(asof):
+    """Sanity-check the wire call: correct URL, from/to/token params."""
+    session_day = asof.date()  # 2026-05-25
+    session = _finnhub_session(_finnhub_payload())
+    cal = FinnhubEarningsCalendar(api_key="secret-token", session=session)
+    cal("AAA", session_day)
+
+    call_args = session.get.call_args
+    assert call_args.args[0] == FINNHUB_EARNINGS_URL
+    params = call_args.kwargs["params"]
+    assert params["from"] == "2026-05-25"
+    assert params["to"]   == "2026-05-26"   # [session_day, session_day+1]
+    assert params["token"] == "secret-token"
+
+
+def test_finnhub_network_failure_disables_filter_for_session(asof, caplog):
+    """Network exception → log warning, return False for every query that
+    day, AND don't crash. Filter is a no-op rather than blocking."""
     session_day = asof.date()
-    err = ConnectionError("simulated outage")
-    _patch_yf_ticker(monkeypatch, by_symbol={"ZZZ": err})
-
-    cal = YFinanceEarningsCalendar()
-    assert cal("ZZZ", session_day) is False
-    # Cached, so a second call doesn't re-raise / re-query either.
-    assert cal("ZZZ", session_day) is False
-
-
-def test_unverified_session_has_verify_false_and_closes():
-    """The context manager must yield a curl_cffi session with TLS
-    verification disabled and clean it up on exit."""
-    with _yfinance_unverified_session() as session:
-        assert session.verify is False
-        # Should be a curl_cffi session, not a plain requests.Session.
-        from curl_cffi.requests import Session as CurlSession
-        assert isinstance(session, CurlSession)
+    session = _finnhub_session(get_exception=ConnectionError("simulated outage"))
+    cal = FinnhubEarningsCalendar(api_key="test-key", session=session)
+    with caplog.at_level("WARNING", logger="scanner"):
+        assert cal("AAA", session_day) is False
+        assert cal("BBB", session_day) is False
+    assert any("Finnhub earnings fetch failed" in r.message for r in caplog.records)
+    # No retry within the session — exactly one HTTP attempt.
+    assert session.get.call_count == 1
 
 
-def test_query_passes_unverified_session_to_yfinance(monkeypatch, asof):
-    """Calendar's _query must hand the unverified session to yf.Ticker
-    so SSL bypass actually reaches the underlying HTTP layer."""
-    captured: dict[str, object] = {}
-
-    def spy_ticker(sym, *args, **kwargs):
-        captured["sym"] = sym
-        captured["session"] = kwargs.get("session")
-        m = MagicMock()
-        m.get_earnings_dates.return_value = pd.DataFrame()
-        return m
-
-    import scanner as scanner_mod
-    monkeypatch.setattr(scanner_mod.yf, "Ticker", spy_ticker)
-
-    YFinanceEarningsCalendar()("AAPL", asof.date())
-    assert captured["sym"] == "AAPL"
-    assert captured["session"] is not None
-    assert captured["session"].verify is False
-
-
-def test_yf_calendar_handles_empty_response(monkeypatch, asof):
-    """get_earnings_dates returning None or empty df → False."""
+def test_finnhub_http_error_disables_filter(asof, caplog):
+    """HTTP 4xx/5xx (raise_for_status) → same fail-open behavior."""
     session_day = asof.date()
-    _patch_yf_ticker(monkeypatch, by_symbol={"NONE": None,
-                                              "EMPTY": pd.DataFrame()})
-    cal = YFinanceEarningsCalendar()
-    assert cal("NONE", session_day) is False
-    assert cal("EMPTY", session_day) is False
+    http_err = RequestException("HTTP 500")
+    session = _finnhub_session(_finnhub_payload(), raise_for_status=http_err)
+    cal = FinnhubEarningsCalendar(api_key="test-key", session=session)
+    with caplog.at_level("WARNING", logger="scanner"):
+        assert cal("AAA", session_day) is False
+    assert any("Finnhub earnings fetch failed" in r.message for r in caplog.records)
 
 
-def test_default_provider_is_yfinance_when_none_supplied(cfg):
-    """Scanner with no explicit provider must use YFinanceEarningsCalendar
+def test_finnhub_missing_api_key_disables_filter(asof, caplog, monkeypatch):
+    """No FINNHUB_API_KEY env var and no explicit key → filter no-op + warning."""
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    session_day = asof.date()
+    cal = FinnhubEarningsCalendar()    # api_key=None, falls back to env
+    with caplog.at_level("WARNING", logger="scanner"):
+        assert cal("AAA", session_day) is False
+    assert any("FINNHUB_API_KEY not set" in r.message for r in caplog.records)
+
+
+def test_finnhub_malformed_response_disables_filter(asof, caplog):
+    """Response missing/changed schema → fail open with warning."""
+    session_day = asof.date()
+    # `earningsCalendar` returns None — the .get(...) yields None which we
+    # treat as empty; that should NOT be an error. Build an actively-broken
+    # case: items list contains a non-dict (causes TypeError on .get).
+    session = _finnhub_session({"earningsCalendar": ["not-a-dict"]})
+    cal = FinnhubEarningsCalendar(api_key="test-key", session=session)
+    with caplog.at_level("WARNING", logger="scanner"):
+        assert cal("AAA", session_day) is False
+    assert any("malformed" in r.message for r in caplog.records)
+
+
+def test_finnhub_empty_calendar_is_not_an_error(asof, caplog):
+    """An empty earnings calendar is a valid response — every symbol
+    returns False, no warning logged."""
+    session_day = asof.date()
+    session = _finnhub_session(_finnhub_payload())   # zero entries
+    cal = FinnhubEarningsCalendar(api_key="test-key", session=session)
+    with caplog.at_level("WARNING", logger="scanner"):
+        assert cal("AAA", session_day) is False
+        assert cal("BBB", session_day) is False
+    assert not any("Finnhub" in r.message for r in caplog.records)
+
+
+def test_default_provider_is_finnhub_when_none_supplied(cfg):
+    """Scanner with no explicit provider must default to FinnhubEarningsCalendar
     so the exclude_earnings_today flag is active out of the box."""
     tc, dc = MagicMock(), MagicMock()
     scn = UniverseScanner(tc, dc, cfg)
-    assert isinstance(scn.earnings_today, YFinanceEarningsCalendar)
+    assert isinstance(scn.earnings_today, FinnhubEarningsCalendar)
 
 
 def test_default_candidate_universe_is_hardcoded_shortlist(cfg):

@@ -16,9 +16,10 @@ cfg.universe    — every filter threshold.
 earnings_today_provider — optional predicate ``(symbol, session_day) -> bool``
                   that returns True iff the symbol has an earnings release
                   scheduled for ``session_day`` (BMO or AMC both count).
-                  Defaults to :class:`YFinanceEarningsCalendar` so the
+                  Defaults to :class:`FinnhubEarningsCalendar` so the
                   ``exclude_earnings_today`` config flag is active out of
-                  the box.
+                  the box (requires ``FINNHUB_API_KEY`` env var; without
+                  one the calendar logs a warning and degrades to no-op).
 
 Output: ``ScanResult`` with `watchlist` (top-N sorted by RVOL desc) and
         `rejections` (symbol → first failing filter, for debugging).
@@ -27,16 +28,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-from contextlib import contextmanager
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Callable, Iterable, Iterator
+from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import yfinance as yf
-from yfinance.exceptions import YFException
-from curl_cffi import requests as curl_requests
+import requests
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
@@ -65,10 +64,9 @@ DEFAULT_CANDIDATE_SYMBOLS: tuple[str, ...] = (
 )
 
 # Hard upper bound on how many symbols a single scan will process. Pre-market
-# data fetches and per-symbol yfinance lookups scale linearly, so this caps
-# scan latency and rate-limit exposure. Inputs above the cap are truncated
-# (with a warning) rather than rejected, so a fat CLI list still produces a
-# usable watchlist.
+# data fetches scale linearly with this list, so the cap bounds scan latency.
+# Inputs above the cap are truncated (with a warning) rather than rejected,
+# so a fat CLI list still produces a usable watchlist.
 MAX_SYMBOLS_PER_SCAN: int = 100
 
 
@@ -98,95 +96,107 @@ class ScanResult:
 
 # ── Earnings calendar ───────────────────────────────────────────────────
 
-# Exception surface for transient yfinance failures (cert errors, schema
-# drift, missing tickers, transient HTTP). The list is broader than ideal
-# because yfinance is a screen-scraper, but it stays narrower than a bare
-# ``except Exception:`` so unexpected programmer errors still surface.
-_YF_LOOKUP_ERRORS = (
+FINNHUB_EARNINGS_URL = "https://finnhub.io/api/v1/calendar/earnings"
+
+# Narrow exception surface for the Finnhub HTTP path. Anything outside this
+# tuple (e.g. KeyboardInterrupt, programmer errors) propagates so it isn't
+# silently swallowed — per build-style: no bare `except Exception:`.
+_FINNHUB_LOOKUP_ERRORS = (
     RequestException, ConnectionError, TimeoutError, OSError,
-    ValueError, KeyError, AttributeError, IndexError, TypeError,
-    YFException,   # rate-limits, missing tickers, prices-missing, etc.
+    ValueError, KeyError, TypeError, AttributeError,
 )
 
 
-# One-time startup warning. yfinance fetches via curl_cffi which, on this
-# host's corporate cert chain, fails verification against fc.yahoo.com.
-# We disable verification ONLY for the earnings-calendar path; Alpaca
-# (which carries API keys) is untouched and still strictly verified.
-logger.warning(
-    "yfinance SSL verification disabled — public market data only, "
-    "no secrets transmitted via this path"
-)
+class FinnhubEarningsCalendar:
+    """Earnings-today predicate backed by Finnhub's ``/calendar/earnings``.
 
+    Strategy: lazy single fetch per ``session_day``. The first
+    ``_has_earnings_today`` call for a day pulls every earnings
+    announcement in ``[session_day, session_day + 1d]`` (the extra day
+    covers any tz fuzziness from Finnhub) and caches the set of symbols
+    whose Finnhub-reported ``date`` equals ``session_day``. Subsequent
+    lookups are O(1) set membership tests — no per-symbol HTTP, no
+    rate-limit pressure.
 
-@contextmanager
-def _yfinance_unverified_session() -> Iterator[curl_requests.Session]:
-    """Yield a short-lived curl_cffi session with TLS verification off.
-
-    Scoped to a single yfinance call so the bypass never leaks to any
-    other HTTP path in the codebase. yfinance accepts a ``session=``
-    kwarg on ``Ticker`` and reuses it for every internal request
-    (cookie, crumb, scrape), so a single session covers the full call.
-    """
-    session = curl_requests.Session()
-    session.verify = False
-    try:
-        yield session
-    finally:
-        session.close()
-
-
-class YFinanceEarningsCalendar:
-    """Per-symbol earnings-today predicate backed by yfinance.
-
-    yfinance has no bulk endpoint — we query one ticker at a time and
-    cache the boolean by ``(symbol, session_day)`` so a single scan only
-    hits the network once per candidate. Any transient lookup failure
-    fails *open* (returns ``False``) and is cached: a flaky earnings feed
-    must not silently block an entire scan, and re-querying mid-session
-    won't help.
+    Failure policy (spec §"if the call fails, treat the filter as a
+    no-op with a warning"): missing API key, network error, HTTP non-2xx,
+    malformed JSON → log a single warning AND cache ``None`` for the
+    session_day so we don't retry mid-scan. All subsequent lookups that
+    day return ``False`` (fail open). The scanner thus skips the
+    earnings filter for that session instead of blocking on bad data
+    or crashing the bot.
     """
 
-    def __init__(self) -> None:
-        self._cache: dict[tuple[str, date], bool] = {}
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        session: requests.Session | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self._api_key = api_key if api_key is not None else os.environ.get("FINNHUB_API_KEY")
+        self._session = session if session is not None else requests.Session()
+        self._timeout = timeout_seconds
+        # day → frozenset of symbols with earnings on that day, or None if
+        # the fetch failed and the filter is disabled for the session.
+        self._cache: dict[date, frozenset[str] | None] = {}
 
     def __call__(self, symbol: str, session_day: date) -> bool:
         return self._has_earnings_today(symbol, session_day)
 
     def _has_earnings_today(self, symbol: str, session_day: date) -> bool:
-        sym = symbol.upper()
-        key = (sym, session_day)
-        if key in self._cache:
-            return self._cache[key]
-        hit = self._query(sym, session_day)
-        self._cache[key] = hit
-        return hit
+        if session_day not in self._cache:
+            self._cache[session_day] = self._fetch_session_set(session_day)
+        symbols = self._cache[session_day]
+        if symbols is None:                    # fetch failed → filter no-op
+            return False
+        return symbol.upper() in symbols
 
-    @staticmethod
-    def _query(sym: str, session_day: date) -> bool:
+    def _fetch_session_set(self, session_day: date) -> frozenset[str] | None:
+        """Return the frozenset of symbols with earnings on ``session_day``,
+        or ``None`` if the fetch failed (logged warning, filter disabled)."""
+        if not self._api_key:
+            logger.warning(
+                "FINNHUB_API_KEY not set — earnings filter disabled for session %s",
+                session_day,
+            )
+            return None
+
+        # Fetch [session_day, session_day+1] to absorb any UTC-vs-ET drift in
+        # Finnhub's `date` field; we re-filter on equality below so AMC of the
+        # next day never leaks into today's set.
+        params = {
+            "from": session_day.isoformat(),
+            "to":   (session_day + timedelta(days=1)).isoformat(),
+            "token": self._api_key,
+        }
         try:
-            with _yfinance_unverified_session() as session:
-                df = yf.Ticker(sym, session=session).get_earnings_dates(limit=16)
-        except _YF_LOOKUP_ERRORS as exc:
-            logger.warning("yfinance earnings lookup failed sym=%s err=%s", sym, exc)
-            return False
+            resp = self._session.get(FINNHUB_EARNINGS_URL, params=params, timeout=self._timeout)
+            resp.raise_for_status()
+            body = resp.json()
+        except _FINNHUB_LOOKUP_ERRORS as exc:
+            logger.warning(
+                "Finnhub earnings fetch failed session=%s err=%s — "
+                "earnings filter disabled for this session",
+                session_day, exc,
+            )
+            return None
 
-        if df is None or getattr(df, "empty", True):
-            return False
-
-        # The earnings DataFrame is indexed by a tz-aware DatetimeIndex
-        # (typically US/Eastern). BMO and AMC both share the same calendar
-        # date, so a date-component equality check is sufficient — we do
-        # not need to distinguish before/after the bell.
         try:
-            for ts in df.index:
-                ts_ny = ts.tz_convert(NY_TZ) if getattr(ts, "tzinfo", None) else ts
-                if ts_ny.date() == session_day:
-                    return True
-        except _YF_LOOKUP_ERRORS as exc:
-            logger.warning("yfinance earnings parse failed sym=%s err=%s", sym, exc)
-            return False
-        return False
+            items = body.get("earningsCalendar") or []
+            session_str = session_day.isoformat()
+            return frozenset(
+                str(item["symbol"]).upper()
+                for item in items
+                if item.get("symbol") and item.get("date") == session_str
+            )
+        except _FINNHUB_LOOKUP_ERRORS as exc:
+            logger.warning(
+                "Finnhub earnings response malformed session=%s err=%s — "
+                "earnings filter disabled for this session",
+                session_day, exc,
+            )
+            return None
 
 
 # ── Scanner ─────────────────────────────────────────────────────────────
@@ -204,11 +214,11 @@ class UniverseScanner:
         self.tc = trading_client
         self.dc = data_client
         self.cfg = (cfg or get_strategy_config()).universe
-        # Default to yfinance so `exclude_earnings_today` is active out of
-        # the box and no warning fires. Callers can still pass an explicit
-        # provider (e.g. a CSV-backed one, or a no-op for tests).
+        # Default to Finnhub so `exclude_earnings_today` is active out of
+        # the box. Callers can pass an explicit provider (CSV-backed, a
+        # no-op for tests, etc.) and override.
         self.earnings_today: Callable[[str, date], bool] = (
-            earnings_today_provider or YFinanceEarningsCalendar()
+            earnings_today_provider or FinnhubEarningsCalendar()
         )
         # Candidate universe: if the caller doesn't pin one, fall back to
         # DEFAULT_CANDIDATE_SYMBOLS so every scan stays on the operator's

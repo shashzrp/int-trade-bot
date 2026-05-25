@@ -15,7 +15,7 @@ universe:
   mega_caps: [AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSLA]
   daily_atr_pct_min: 2.0
   spread_max_pct: 0.1
-  exclude_earnings_today: false
+  exclude_earnings_today: true
   max_watchlist_size: 10
 
 indicators:
