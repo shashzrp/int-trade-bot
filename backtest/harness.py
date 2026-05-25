@@ -59,10 +59,11 @@ class FillRecord:
     ts: datetime
     symbol: str
     side: str               # 'long' / 'short'
-    tranche: str            # 'entry' / 'T1' / 'T2' / 'T3' / 'STOP' / 'HARD'
+    tranche: str            # 'entry' / 'T1' / 'T2' / 'T3' / 'HARD' / 'EOD_FLAT'
     qty: int
     price: float
     pnl: float = 0.0        # 0 on entries; signed on exits
+    r_per_share: float = 0.0  # |entry − stop|, set on entry fills only
 
 
 @dataclass
@@ -219,6 +220,7 @@ class BacktestEngine:
                 fills.append(FillRecord(
                     ts=ts, symbol=sym, side=side, tranche="entry",
                     qty=size.shares, price=entry_fill, pnl=0.0,
+                    r_per_share=abs(entry_fill - stop),
                 ))
 
         # End-of-day mark: close any still-open positions at the last bar's close.

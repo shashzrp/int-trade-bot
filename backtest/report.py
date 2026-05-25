@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
@@ -25,6 +25,55 @@ logger = logging.getLogger(__name__)
 
 # Annualization factor for daily-return Sharpe (US trading days)
 TRADING_DAYS_PER_YEAR = 252
+
+
+@dataclass
+class TrancheBreakdown:
+    """How trades resolved across the three-stage exit ladder.
+
+    Buckets are mutually exclusive and are defined by the *furthest* tranche
+    each trade reached:
+
+      stopped  — trade closed (HARD / EOD_FLAT) without T1 ever firing
+      t1       — T1 fired; trade closed before T2
+      t2       — T1+T2 fired; trade closed before T3 (runner force-flatted)
+      runner   — T3 fired (runner trail exit)
+
+    ``avg_R_*`` is the mean of total-trade R-multiples for that bucket, where
+    R-multiple = total_trade_pnl / (initial_qty × r_per_share).
+    """
+    n_stopped: int
+    n_t1: int
+    n_t2: int
+    n_runner: int
+    avg_R_stopped: float
+    avg_R_t1: float
+    avg_R_t2: float
+    avg_R_runner: float
+
+    @property
+    def n_total(self) -> int:
+        return self.n_stopped + self.n_t1 + self.n_t2 + self.n_runner
+
+    def text_summary(self) -> str:
+        total = max(1, self.n_total)
+        def pct(n: int) -> str:
+            return f"{n / total * 100:5.1f}%"
+        return (
+            f"  Tranche breakdown:\n"
+            f"    Stopped (no T1):  {self.n_stopped:4d}  ({pct(self.n_stopped)})  "
+            f"avg R = {self.avg_R_stopped:+.2f}\n"
+            f"    Exited at T1:     {self.n_t1:4d}  ({pct(self.n_t1)})  "
+            f"avg R = {self.avg_R_t1:+.2f}\n"
+            f"    Exited at T2:     {self.n_t2:4d}  ({pct(self.n_t2)})  "
+            f"avg R = {self.avg_R_t2:+.2f}\n"
+            f"    Runner (T3):      {self.n_runner:4d}  ({pct(self.n_runner)})  "
+            f"avg R = {self.avg_R_runner:+.2f}\n"
+        )
+
+
+def _empty_breakdown() -> TrancheBreakdown:
+    return TrancheBreakdown(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)
 
 
 @dataclass
@@ -41,6 +90,7 @@ class ReportMetrics:
     max_drawdown_pct: float  # fraction in [0, 1]
     total_return_pct: float
     trades_per_day: float
+    tranche_breakdown: TrancheBreakdown = field(default_factory=_empty_breakdown)
 
     def text_summary(self) -> str:
         return (
@@ -53,6 +103,7 @@ class ReportMetrics:
             f"  Max drawdown:     {self.max_drawdown_pct * 100:.2f}%\n"
             f"  Sharpe (annual):  {self.sharpe:.2f}\n"
             f"  Total return:     {self.total_return_pct:.2f}%\n"
+            f"{self.tranche_breakdown.text_summary()}"
         )
 
     def passes_viability_gates(self) -> bool:
@@ -65,33 +116,95 @@ class ReportMetrics:
         )
 
 
+@dataclass
+class _Trade:
+    """One entry → terminal-close grouping, used internally for metrics."""
+    entry_qty: int
+    r_per_share: float
+    total_pnl: float
+    tranches_hit: set[str]   # subset of {'T1','T2','T3','HARD','EOD_FLAT'}
+
+
+def _group_trades(fills: list[FillRecord]) -> list[_Trade]:
+    """Walk fills in order; each 'entry' starts a new trade and exit fills
+    accumulate onto it until the next entry."""
+    trades: list[_Trade] = []
+    cur: _Trade | None = None
+    for fr in fills:
+        if fr.tranche == "entry":
+            if cur is not None:
+                trades.append(cur)
+            cur = _Trade(
+                entry_qty=fr.qty,
+                r_per_share=fr.r_per_share,
+                total_pnl=0.0,
+                tranches_hit=set(),
+            )
+        else:
+            if cur is None:
+                continue   # defensive: exit before any entry — skip
+            cur.total_pnl += fr.pnl
+            cur.tranches_hit.add(fr.tranche)
+    if cur is not None:
+        trades.append(cur)
+    return trades
+
+
+def _bucket_for(trade: _Trade) -> str:
+    """Furthest tranche reached, regardless of how the trade terminally closed."""
+    if "T3" in trade.tranches_hit:
+        return "runner"
+    if "T2" in trade.tranches_hit:
+        return "t2"
+    if "T1" in trade.tranches_hit:
+        return "t1"
+    return "stopped"
+
+
+def _compute_tranche_breakdown(trades: list[_Trade]) -> TrancheBreakdown:
+    buckets: dict[str, list[float]] = {"stopped": [], "t1": [], "t2": [], "runner": []}
+    for t in trades:
+        denom = t.entry_qty * t.r_per_share
+        # Zero-risk trades shouldn't happen (entry≠stop) but guard anyway:
+        r_mult = (t.total_pnl / denom) if denom > 0 else 0.0
+        buckets[_bucket_for(t)].append(r_mult)
+
+    def avg(xs: list[float]) -> float:
+        return float(np.mean(xs)) if xs else 0.0
+
+    return TrancheBreakdown(
+        n_stopped=len(buckets["stopped"]),
+        n_t1=len(buckets["t1"]),
+        n_t2=len(buckets["t2"]),
+        n_runner=len(buckets["runner"]),
+        avg_R_stopped=avg(buckets["stopped"]),
+        avg_R_t1=avg(buckets["t1"]),
+        avg_R_t2=avg(buckets["t2"]),
+        avg_R_runner=avg(buckets["runner"]),
+    )
+
+
 def compute_metrics(result: BacktestResult) -> ReportMetrics:
     """Aggregate fills into round-trip P&L per (entry → close) pairing.
 
-    Strategy: a trade is the SET of fills sharing the same symbol between an
-    'entry' fill and the next terminal-close (T3 / EOD_FLAT).  Simpler proxy:
-    sum the per-fill `pnl` field (which is 0 on entries) — gives the same
-    realized total.  But for win/loss counts we group by (symbol, position id).
+    A trade = one 'entry' fill plus every exit fill until the next entry.
+    Win/loss counts use $-PnL; the tranche breakdown classifies each trade by
+    the furthest stage of the exit ladder it reached.
     """
     fills = result.fills
     if not fills:
-        return ReportMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        return ReportMetrics(
+            n_trades=0, n_wins=0, n_losses=0,
+            win_rate=0.0, avg_win=0.0, avg_loss=0.0,
+            win_loss_ratio=0.0, profit_factor=0.0,
+            sharpe=0.0, max_drawdown_pct=0.0,
+            total_return_pct=0.0, trades_per_day=0.0,
+            tranche_breakdown=_empty_breakdown(),
+        )
 
-    # Group into per-position P&L
-    trade_pnls: list[float] = []
-    current_pnl = 0.0
-    current_active = False
-    for fr in fills:
-        if fr.tranche == "entry":
-            if current_active and abs(current_pnl) > 0:
-                trade_pnls.append(current_pnl)
-            current_pnl = 0.0
-            current_active = True
-        else:
-            current_pnl += fr.pnl
-    if current_active and abs(current_pnl) > 0:
-        trade_pnls.append(current_pnl)
-
+    trades = _group_trades(fills)
+    # Preserve prior behaviour: win/loss stats ignore exact-zero-PnL trades.
+    trade_pnls = [t.total_pnl for t in trades if abs(t.total_pnl) > 0]
     arr = np.array(trade_pnls, dtype=float)
     wins = arr[arr > 0]
     losses = arr[arr < 0]
@@ -132,6 +245,7 @@ def compute_metrics(result: BacktestResult) -> ReportMetrics:
         win_loss_ratio=wl_ratio, profit_factor=pf,
         sharpe=float(sharpe), max_drawdown_pct=max_dd,
         total_return_pct=total_ret_pct, trades_per_day=trades_per_day,
+        tranche_breakdown=_compute_tranche_breakdown(trades),
     )
 
 
@@ -165,7 +279,8 @@ def _save_equity_curve_png(result: BacktestResult, path: Path) -> None:
 def _save_fills_csv(result: BacktestResult, path: Path) -> None:
     rows = [
         {"ts": fr.ts, "symbol": fr.symbol, "side": fr.side, "tranche": fr.tranche,
-         "qty": fr.qty, "price": fr.price, "pnl": fr.pnl}
+         "qty": fr.qty, "price": fr.price, "pnl": fr.pnl,
+         "r_per_share": fr.r_per_share}
         for fr in result.fills
     ]
     pd.DataFrame(rows).to_csv(path, index=False)

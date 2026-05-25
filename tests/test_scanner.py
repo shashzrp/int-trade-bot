@@ -23,6 +23,7 @@ from scanner import (
     Candidate,
     ScanResult,
     UniverseScanner,
+    YFinanceEarningsCalendar,
 )
 
 
@@ -94,9 +95,14 @@ def _make_scanner(cfg, *,
         return SimpleNamespace(**defaults)
     tc.get_asset.side_effect = fake_get_asset
 
+    # Always supply a deterministic predicate so the scanner never falls
+    # through to the default yfinance lookup during tests.
+    earn_set = {s.upper() for s in (earnings_today or set())}
+    earnings_predicate = lambda sym, day: sym.upper() in earn_set  # noqa: E731
+
     scn = UniverseScanner(
         tc, dc, cfg,
-        earnings_today_provider=(lambda d: earnings_today) if earnings_today is not None else None,
+        earnings_today_provider=earnings_predicate,
         candidate_symbols=symbols,
     )
     # Stub the cheap-filter stage so all supplied symbols pass.
@@ -309,3 +315,125 @@ def test_insufficient_history_rejected(cfg, asof):
                         quotes={"X": _quote(104.95, 105.05)})
     res = scn.scan(asof=asof)
     assert res.rejections["X"] == "insufficient_daily_history"
+
+
+# ── YFinanceEarningsCalendar ───────────────────────────────────────────
+
+def _mock_earnings_df(*dates_ny: datetime) -> pd.DataFrame:
+    """Build a yfinance-shaped earnings DataFrame indexed by tz-aware ts."""
+    idx = pd.DatetimeIndex(dates_ny)
+    return pd.DataFrame(
+        {"EPS Estimate": [None] * len(idx),
+         "Reported EPS": [None] * len(idx),
+         "Surprise(%)": [None] * len(idx)},
+        index=idx,
+    )
+
+
+def _patch_yf_ticker(monkeypatch, *, by_symbol: dict[str, object]):
+    """Patch scanner.yf.Ticker so each symbol returns a canned mock.
+
+    Each value in ``by_symbol`` is either a DataFrame (returned from
+    ``get_earnings_dates``) or an Exception instance (raised from it).
+    """
+    def fake_ticker(sym: str):
+        mock = MagicMock()
+        canned = by_symbol.get(sym.upper())
+        if isinstance(canned, BaseException):
+            mock.get_earnings_dates.side_effect = canned
+        else:
+            mock.get_earnings_dates.return_value = canned
+        return mock
+
+    import scanner as scanner_mod
+    monkeypatch.setattr(scanner_mod.yf, "Ticker", fake_ticker)
+
+
+def test_yf_calendar_hits_on_matching_session_day(monkeypatch, asof):
+    """A symbol whose earnings calendar lists the session day → True."""
+    session_day = asof.date()  # 2026-05-25
+    df = _mock_earnings_df(datetime(2026, 5, 25, 16, 30, tzinfo=NY_TZ))
+    _patch_yf_ticker(monkeypatch, by_symbol={"AAA": df})
+
+    cal = YFinanceEarningsCalendar()
+    assert cal("AAA", session_day) is True
+
+
+def test_yf_calendar_misses_on_other_days(monkeypatch, asof):
+    """No matching date in the calendar → False."""
+    session_day = asof.date()
+    df = _mock_earnings_df(
+        datetime(2026, 5, 26, 16, 30, tzinfo=NY_TZ),
+        datetime(2026, 5, 24, 9, 0, tzinfo=NY_TZ),
+    )
+    _patch_yf_ticker(monkeypatch, by_symbol={"BBB": df})
+
+    cal = YFinanceEarningsCalendar()
+    assert cal("BBB", session_day) is False
+
+
+def test_yf_calendar_bmo_and_amc_both_count(monkeypatch, asof):
+    """Before-market and after-market both share the calendar date."""
+    session_day = asof.date()
+    bmo = _mock_earnings_df(datetime(2026, 5, 25, 7, 0, tzinfo=NY_TZ))   # 07:00 ET
+    amc = _mock_earnings_df(datetime(2026, 5, 25, 16, 30, tzinfo=NY_TZ)) # 16:30 ET
+    _patch_yf_ticker(monkeypatch, by_symbol={"BMO": bmo, "AMC": amc})
+
+    cal = YFinanceEarningsCalendar()
+    assert cal("BMO", session_day) is True
+    assert cal("AMC", session_day) is True
+
+
+def test_yf_calendar_caches_per_session_day(monkeypatch, asof):
+    """Two calls for the same (symbol, day) must not re-query yfinance."""
+    session_day = asof.date()
+    df = _mock_earnings_df(datetime(2026, 5, 25, 16, 30, tzinfo=NY_TZ))
+
+    call_count = {"n": 0}
+    def counting_ticker(sym):
+        call_count["n"] += 1
+        m = MagicMock()
+        m.get_earnings_dates.return_value = df
+        return m
+    import scanner as scanner_mod
+    monkeypatch.setattr(scanner_mod.yf, "Ticker", counting_ticker)
+
+    cal = YFinanceEarningsCalendar()
+    cal("AAA", session_day)
+    cal("AAA", session_day)
+    cal("AAA", session_day)
+    assert call_count["n"] == 1
+
+    # A different session day must miss the cache and query again.
+    cal("AAA", session_day + timedelta(days=1))
+    assert call_count["n"] == 2
+
+
+def test_yf_calendar_handles_network_failure(monkeypatch, asof):
+    """A lookup exception → fails open (False) and caches the negative."""
+    session_day = asof.date()
+    err = ConnectionError("simulated outage")
+    _patch_yf_ticker(monkeypatch, by_symbol={"ZZZ": err})
+
+    cal = YFinanceEarningsCalendar()
+    assert cal("ZZZ", session_day) is False
+    # Cached, so a second call doesn't re-raise / re-query either.
+    assert cal("ZZZ", session_day) is False
+
+
+def test_yf_calendar_handles_empty_response(monkeypatch, asof):
+    """get_earnings_dates returning None or empty df → False."""
+    session_day = asof.date()
+    _patch_yf_ticker(monkeypatch, by_symbol={"NONE": None,
+                                              "EMPTY": pd.DataFrame()})
+    cal = YFinanceEarningsCalendar()
+    assert cal("NONE", session_day) is False
+    assert cal("EMPTY", session_day) is False
+
+
+def test_default_provider_is_yfinance_when_none_supplied(cfg):
+    """Scanner with no explicit provider must use YFinanceEarningsCalendar
+    so the exclude_earnings_today flag is active out of the box."""
+    tc, dc = MagicMock(), MagicMock()
+    scn = UniverseScanner(tc, dc, cfg)
+    assert isinstance(scn.earnings_today, YFinanceEarningsCalendar)

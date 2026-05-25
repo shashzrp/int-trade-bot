@@ -5,8 +5,8 @@ load_dotenv()
 from alpaca.trading.client import TradingClient
 
 client = TradingClient(
-    api_key=os.environ["ALPACA_API_KEY_ID"],
-    secret_key=os.environ["ALPACA_API_SECRET"],
+    api_key=os.environ["ALPACA_API_KEY"],
+    secret_key=os.environ["ALPACA_SECRET_KEY"],
     paper=True,
 )
 

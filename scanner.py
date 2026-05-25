@@ -13,11 +13,12 @@ data_client     — `alpaca.data.historical.StockHistoricalDataClient`.
                   Used for daily bars (ADV, ATR, gap), pre-market 1-min
                   bars (PM volume), and latest quote (price, spread).
 cfg.universe    — every filter threshold.
-earnings_today_provider — optional callable ``date -> Iterable[str]`` that
-                  yields symbols with earnings releasing post-close today.
-                  Alpaca has no earnings endpoint; wire your own source
-                  (Polygon, Finnhub, CSV).  If None, the filter is a no-op
-                  and a warning is logged.
+earnings_today_provider — optional predicate ``(symbol, session_day) -> bool``
+                  that returns True iff the symbol has an earnings release
+                  scheduled for ``session_day`` (BMO or AMC both count).
+                  Defaults to :class:`YFinanceEarningsCalendar` so the
+                  ``exclude_earnings_today`` config flag is active out of
+                  the box.
 
 Output: ``ScanResult`` with `watchlist` (top-N sorted by RVOL desc) and
         `rejections` (symbol → first failing filter, for debugging).
@@ -32,6 +33,7 @@ from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import yfinance as yf
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
@@ -39,6 +41,7 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetExchange, AssetStatus
 from alpaca.trading.requests import GetAssetsRequest
+from requests.exceptions import RequestException
 
 from config import StrategyConfig, get_strategy_config
 from indicators import atr, true_range
@@ -74,6 +77,70 @@ class ScanResult:
     rejections: dict[str, str] = field(default_factory=dict)
 
 
+# ── Earnings calendar ───────────────────────────────────────────────────
+
+# Exception surface for transient yfinance failures (cert errors, schema
+# drift, missing tickers, transient HTTP). The list is broader than ideal
+# because yfinance is a screen-scraper, but it stays narrower than a bare
+# ``except Exception:`` so unexpected programmer errors still surface.
+_YF_LOOKUP_ERRORS = (
+    RequestException, ConnectionError, TimeoutError, OSError,
+    ValueError, KeyError, AttributeError, IndexError, TypeError,
+)
+
+
+class YFinanceEarningsCalendar:
+    """Per-symbol earnings-today predicate backed by yfinance.
+
+    yfinance has no bulk endpoint — we query one ticker at a time and
+    cache the boolean by ``(symbol, session_day)`` so a single scan only
+    hits the network once per candidate. Any transient lookup failure
+    fails *open* (returns ``False``) and is cached: a flaky earnings feed
+    must not silently block an entire scan, and re-querying mid-session
+    won't help.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, date], bool] = {}
+
+    def __call__(self, symbol: str, session_day: date) -> bool:
+        return self._has_earnings_today(symbol, session_day)
+
+    def _has_earnings_today(self, symbol: str, session_day: date) -> bool:
+        sym = symbol.upper()
+        key = (sym, session_day)
+        if key in self._cache:
+            return self._cache[key]
+        hit = self._query(sym, session_day)
+        self._cache[key] = hit
+        return hit
+
+    @staticmethod
+    def _query(sym: str, session_day: date) -> bool:
+        try:
+            df = yf.Ticker(sym).get_earnings_dates(limit=16)
+        except _YF_LOOKUP_ERRORS as exc:
+            logger.warning("yfinance earnings lookup failed sym=%s err=%s", sym, exc)
+            return False
+
+        if df is None or getattr(df, "empty", True):
+            return False
+
+        # The earnings DataFrame is indexed by a tz-aware DatetimeIndex
+        # (typically US/Eastern). BMO and AMC both share the same calendar
+        # date, so a date-component equality check is sufficient — we do
+        # not need to distinguish before/after the bell.
+        try:
+            for ts in df.index:
+                ts_ny = ts.tz_convert(NY_TZ) if getattr(ts, "tzinfo", None) else ts
+                if ts_ny.date() == session_day:
+                    return True
+        except _YF_LOOKUP_ERRORS as exc:
+            logger.warning("yfinance earnings parse failed sym=%s err=%s", sym, exc)
+            return False
+        return False
+
+
 # ── Scanner ─────────────────────────────────────────────────────────────
 
 class UniverseScanner:
@@ -83,13 +150,18 @@ class UniverseScanner:
         data_client: StockHistoricalDataClient,
         cfg: StrategyConfig | None = None,
         *,
-        earnings_today_provider: Callable[[date], Iterable[str]] | None = None,
+        earnings_today_provider: Callable[[str, date], bool] | None = None,
         candidate_symbols: Iterable[str] | None = None,
     ) -> None:
         self.tc = trading_client
         self.dc = data_client
         self.cfg = (cfg or get_strategy_config()).universe
-        self.earnings_today = earnings_today_provider
+        # Default to yfinance so `exclude_earnings_today` is active out of
+        # the box and no warning fires. Callers can still pass an explicit
+        # provider (e.g. a CSV-backed one, or a no-op for tests).
+        self.earnings_today: Callable[[str, date], bool] = (
+            earnings_today_provider or YFinanceEarningsCalendar()
+        )
         # Optional pre-filter — if supplied, skip the asset-metadata sweep.
         self._candidate_symbols = (
             None if candidate_symbols is None else [s.upper() for s in candidate_symbols]
@@ -110,22 +182,16 @@ class UniverseScanner:
             logger.warning("No symbols survived asset-metadata pre-filter.")
             return result
 
-        # Stage 2 — earnings exclusion (cheap, in-process)
+        # Stage 2 — earnings exclusion (predicate is called once per symbol;
+        # YFinanceEarningsCalendar caches by (symbol, session_day) internally).
         if self.cfg.get("exclude_earnings_today", True):
-            if self.earnings_today is None:
-                logger.warning(
-                    "exclude_earnings_today=true but no earnings_today_provider supplied — "
-                    "filter is a no-op for this run."
-                )
-            else:
-                earn = {s.upper() for s in self.earnings_today(session_day)}
-                survivors = []
-                for s in symbols:
-                    if s in earn:
-                        result.rejections[s] = "earnings_today"
-                    else:
-                        survivors.append(s)
-                symbols = survivors
+            survivors = []
+            for s in symbols:
+                if self.earnings_today(s, session_day):
+                    result.rejections[s] = "earnings_today"
+                else:
+                    survivors.append(s)
+            symbols = survivors
 
         if not symbols:
             return result
