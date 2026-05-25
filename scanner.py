@@ -27,20 +27,22 @@ from __future__ import annotations
 
 import argparse
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
+from yfinance.exceptions import YFException
+from curl_cffi import requests as curl_requests
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetExchange, AssetStatus
-from alpaca.trading.requests import GetAssetsRequest
 from requests.exceptions import RequestException
 
 from config import StrategyConfig, get_strategy_config
@@ -51,6 +53,23 @@ logger = logging.getLogger(__name__)
 NY_TZ = ZoneInfo("America/New_York")
 PREMARKET_START = time(4, 0)
 SESSION_OPEN = time(9, 30)
+
+# Default candidate universe applied whenever the caller does not supply an
+# explicit ``candidate_symbols`` list. The bot is intentionally narrow —
+# concentrating discipline on a small, liquid set instead of sweeping the
+# whole exchange. Order is preserved as given by the operator; duplicates
+# in the spec (AMD, MSFT) were dropped here.
+DEFAULT_CANDIDATE_SYMBOLS: tuple[str, ...] = (
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "GOOGL", "AMZN",
+    "ORCL", "PLTR", "SNPS", "OKLO", "ACN", "ASML", "AVGO", "RKLB", "MRVL",
+)
+
+# Hard upper bound on how many symbols a single scan will process. Pre-market
+# data fetches and per-symbol yfinance lookups scale linearly, so this caps
+# scan latency and rate-limit exposure. Inputs above the cap are truncated
+# (with a warning) rather than rejected, so a fat CLI list still produces a
+# usable watchlist.
+MAX_SYMBOLS_PER_SCAN: int = 100
 
 
 # ── Public types ────────────────────────────────────────────────────────
@@ -86,7 +105,35 @@ class ScanResult:
 _YF_LOOKUP_ERRORS = (
     RequestException, ConnectionError, TimeoutError, OSError,
     ValueError, KeyError, AttributeError, IndexError, TypeError,
+    YFException,   # rate-limits, missing tickers, prices-missing, etc.
 )
+
+
+# One-time startup warning. yfinance fetches via curl_cffi which, on this
+# host's corporate cert chain, fails verification against fc.yahoo.com.
+# We disable verification ONLY for the earnings-calendar path; Alpaca
+# (which carries API keys) is untouched and still strictly verified.
+logger.warning(
+    "yfinance SSL verification disabled — public market data only, "
+    "no secrets transmitted via this path"
+)
+
+
+@contextmanager
+def _yfinance_unverified_session() -> Iterator[curl_requests.Session]:
+    """Yield a short-lived curl_cffi session with TLS verification off.
+
+    Scoped to a single yfinance call so the bypass never leaks to any
+    other HTTP path in the codebase. yfinance accepts a ``session=``
+    kwarg on ``Ticker`` and reuses it for every internal request
+    (cookie, crumb, scrape), so a single session covers the full call.
+    """
+    session = curl_requests.Session()
+    session.verify = False
+    try:
+        yield session
+    finally:
+        session.close()
 
 
 class YFinanceEarningsCalendar:
@@ -118,7 +165,8 @@ class YFinanceEarningsCalendar:
     @staticmethod
     def _query(sym: str, session_day: date) -> bool:
         try:
-            df = yf.Ticker(sym).get_earnings_dates(limit=16)
+            with _yfinance_unverified_session() as session:
+                df = yf.Ticker(sym, session=session).get_earnings_dates(limit=16)
         except _YF_LOOKUP_ERRORS as exc:
             logger.warning("yfinance earnings lookup failed sym=%s err=%s", sym, exc)
             return False
@@ -162,10 +210,25 @@ class UniverseScanner:
         self.earnings_today: Callable[[str, date], bool] = (
             earnings_today_provider or YFinanceEarningsCalendar()
         )
-        # Optional pre-filter — if supplied, skip the asset-metadata sweep.
-        self._candidate_symbols = (
-            None if candidate_symbols is None else [s.upper() for s in candidate_symbols]
-        )
+        # Candidate universe: if the caller doesn't pin one, fall back to
+        # DEFAULT_CANDIDATE_SYMBOLS so every scan stays on the operator's
+        # vetted shortlist. Passing an explicit list still overrides.
+        chosen = candidate_symbols if candidate_symbols is not None else DEFAULT_CANDIDATE_SYMBOLS
+        # Normalize, order-preserving dedup, and enforce the per-scan cap.
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for sym in chosen:
+            up = sym.upper()
+            if up not in seen:
+                seen.add(up)
+                normalized.append(up)
+        if len(normalized) > MAX_SYMBOLS_PER_SCAN:
+            logger.warning(
+                "candidate_symbols truncated from %d to %d (MAX_SYMBOLS_PER_SCAN)",
+                len(normalized), MAX_SYMBOLS_PER_SCAN,
+            )
+            normalized = normalized[:MAX_SYMBOLS_PER_SCAN]
+        self._candidate_symbols = normalized
 
     # ── Entry point ────────────────────────────────────────────────
 
@@ -229,16 +292,8 @@ class UniverseScanner:
     # ── Stage 1 ────────────────────────────────────────────────────
 
     def _candidate_universe(self, result: ScanResult) -> list[str]:
-        if self._candidate_symbols is not None:
-            # Caller supplied a pre-screened list — still apply asset filters.
-            assets = [self._safe_get_asset(s, result) for s in self._candidate_symbols]
-            assets = [a for a in assets if a is not None]
-        else:
-            req = GetAssetsRequest(
-                status=AssetStatus.ACTIVE,
-                asset_class=AssetClass.US_EQUITY,
-            )
-            assets = self.tc.get_all_assets(req)
+        assets = [self._safe_get_asset(s, result) for s in self._candidate_symbols]
+        assets = [a for a in assets if a is not None]
 
         allowed_ex = {AssetExchange.NYSE, AssetExchange.NASDAQ, AssetExchange.ARCA}
         out: list[str] = []

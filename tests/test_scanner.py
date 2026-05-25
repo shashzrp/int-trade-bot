@@ -19,11 +19,14 @@ import pytest
 
 from config import StrategyConfig
 from scanner import (
+    DEFAULT_CANDIDATE_SYMBOLS,
+    MAX_SYMBOLS_PER_SCAN,
     NY_TZ,
     Candidate,
     ScanResult,
     UniverseScanner,
     YFinanceEarningsCalendar,
+    _yfinance_unverified_session,
 )
 
 
@@ -336,7 +339,8 @@ def _patch_yf_ticker(monkeypatch, *, by_symbol: dict[str, object]):
     Each value in ``by_symbol`` is either a DataFrame (returned from
     ``get_earnings_dates``) or an Exception instance (raised from it).
     """
-    def fake_ticker(sym: str):
+    def fake_ticker(sym: str, *args, **kwargs):
+        # Accept (and ignore) the session= kwarg the scanner now passes.
         mock = MagicMock()
         canned = by_symbol.get(sym.upper())
         if isinstance(canned, BaseException):
@@ -390,7 +394,7 @@ def test_yf_calendar_caches_per_session_day(monkeypatch, asof):
     df = _mock_earnings_df(datetime(2026, 5, 25, 16, 30, tzinfo=NY_TZ))
 
     call_count = {"n": 0}
-    def counting_ticker(sym):
+    def counting_ticker(sym, *args, **kwargs):
         call_count["n"] += 1
         m = MagicMock()
         m.get_earnings_dates.return_value = df
@@ -421,6 +425,37 @@ def test_yf_calendar_handles_network_failure(monkeypatch, asof):
     assert cal("ZZZ", session_day) is False
 
 
+def test_unverified_session_has_verify_false_and_closes():
+    """The context manager must yield a curl_cffi session with TLS
+    verification disabled and clean it up on exit."""
+    with _yfinance_unverified_session() as session:
+        assert session.verify is False
+        # Should be a curl_cffi session, not a plain requests.Session.
+        from curl_cffi.requests import Session as CurlSession
+        assert isinstance(session, CurlSession)
+
+
+def test_query_passes_unverified_session_to_yfinance(monkeypatch, asof):
+    """Calendar's _query must hand the unverified session to yf.Ticker
+    so SSL bypass actually reaches the underlying HTTP layer."""
+    captured: dict[str, object] = {}
+
+    def spy_ticker(sym, *args, **kwargs):
+        captured["sym"] = sym
+        captured["session"] = kwargs.get("session")
+        m = MagicMock()
+        m.get_earnings_dates.return_value = pd.DataFrame()
+        return m
+
+    import scanner as scanner_mod
+    monkeypatch.setattr(scanner_mod.yf, "Ticker", spy_ticker)
+
+    YFinanceEarningsCalendar()("AAPL", asof.date())
+    assert captured["sym"] == "AAPL"
+    assert captured["session"] is not None
+    assert captured["session"].verify is False
+
+
 def test_yf_calendar_handles_empty_response(monkeypatch, asof):
     """get_earnings_dates returning None or empty df → False."""
     session_day = asof.date()
@@ -437,3 +472,63 @@ def test_default_provider_is_yfinance_when_none_supplied(cfg):
     tc, dc = MagicMock(), MagicMock()
     scn = UniverseScanner(tc, dc, cfg)
     assert isinstance(scn.earnings_today, YFinanceEarningsCalendar)
+
+
+def test_default_candidate_universe_is_hardcoded_shortlist(cfg):
+    """No candidate_symbols passed → scanner falls back to the
+    operator-vetted DEFAULT_CANDIDATE_SYMBOLS list, not an all-assets sweep."""
+    tc, dc = MagicMock(), MagicMock()
+    scn = UniverseScanner(tc, dc, cfg)
+    assert scn._candidate_symbols == [s.upper() for s in DEFAULT_CANDIDATE_SYMBOLS]
+    # Spot-check a few names from the spec are present.
+    for required in ("AAPL", "NVDA", "OKLO", "MRVL"):
+        assert required in scn._candidate_symbols
+    # No duplicates after dedup.
+    assert len(scn._candidate_symbols) == len(set(scn._candidate_symbols))
+
+
+# ── MAX_SYMBOLS_PER_SCAN cap ───────────────────────────────────────────
+
+def test_max_symbols_per_scan_is_100():
+    """The published cap must be 100 — exposed as MAX_SYMBOLS_PER_SCAN."""
+    assert MAX_SYMBOLS_PER_SCAN == 100
+
+
+def test_candidate_symbols_truncated_at_cap(cfg, caplog):
+    """A list larger than the cap is truncated (with a warning)."""
+    big = [f"S{i:04d}" for i in range(150)]
+    tc, dc = MagicMock(), MagicMock()
+    with caplog.at_level("WARNING", logger="scanner"):
+        scn = UniverseScanner(tc, dc, cfg, candidate_symbols=big)
+    assert len(scn._candidate_symbols) == 100
+    # Order preserved — first 100 input symbols survive.
+    assert scn._candidate_symbols == [s.upper() for s in big[:100]]
+    assert any("truncated from 150 to 100" in rec.message for rec in caplog.records)
+
+
+def test_candidate_symbols_under_cap_pass_through(cfg, caplog):
+    """A list at or below the cap is left intact with no warning."""
+    fifty = [f"S{i:04d}" for i in range(50)]
+    tc, dc = MagicMock(), MagicMock()
+    with caplog.at_level("WARNING", logger="scanner"):
+        scn = UniverseScanner(tc, dc, cfg, candidate_symbols=fifty)
+    assert len(scn._candidate_symbols) == 50
+    assert not any("truncated" in rec.message for rec in caplog.records)
+
+
+def test_duplicates_deduped_before_counting_against_cap(cfg):
+    """Duplicates must not consume cap quota — order-preserving dedup."""
+    inputs = ["AAPL", "msft", "AAPL", "NVDA", "MSFT"]
+    tc, dc = MagicMock(), MagicMock()
+    scn = UniverseScanner(tc, dc, cfg, candidate_symbols=inputs)
+    assert scn._candidate_symbols == ["AAPL", "MSFT", "NVDA"]
+
+
+def test_at_cap_exactly_not_truncated(cfg, caplog):
+    """100 symbols passes through exactly — boundary check."""
+    hundred = [f"S{i:04d}" for i in range(100)]
+    tc, dc = MagicMock(), MagicMock()
+    with caplog.at_level("WARNING", logger="scanner"):
+        scn = UniverseScanner(tc, dc, cfg, candidate_symbols=hundred)
+    assert len(scn._candidate_symbols) == 100
+    assert not any("truncated" in rec.message for rec in caplog.records)
